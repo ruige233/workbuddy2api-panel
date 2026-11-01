@@ -57,6 +57,16 @@ type Config struct {
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
 	} `json:"server"`
 
+	// CORS 跨域放行：浏览器端第三方前端（如 localhost 上的聊天壳）直接调网关时，
+	// 需要网关为预检 OPTIONS 与响应补 Access-Control-* 头。缺省关闭，零行为变化。
+	CORS struct {
+		// Enabled 是否开启 CORS 头注入与 OPTIONS 预检应答，缺省 false。
+		Enabled bool `json:"enabled"`
+		// AllowedOrigins 允许的来源列表（如 ["http://localhost:18181"]）。
+		// 空 = 放行任意 Origin（仅 Enabled=true 时生效）。
+		AllowedOrigins []string `json:"allowed_origins"`
+	} `json:"cors"`
+
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
 		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。

@@ -344,6 +344,9 @@ func main() {
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		// 跨域放行（浏览器端第三方前端直连网关）；缺省关闭，allowed_origins 空 = 放行任意。
+		CORSEnabled:        cfg.CORS.Enabled,
+		CORSAllowedOrigins: cfg.CORS.AllowedOrigins,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供

@@ -381,6 +381,8 @@ curl -s http://localhost:7863/v1/search/messages \
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `dns_servers` | 空 | **出站解析**用的 DNS 服务器（数组，按顺序试，都用不上才报错）；空 = 系统解析器。/etc/resolv.conf 不存在或不可用的环境（Android、精简容器）必须显式配，否则 Go 解析器会退回 `127.0.0.1:53`，查任何域名都变成"连本机 53 端口"（`dial tcp: lookup ... on [::1]:53: connection refused`）。只换 `Transport.DialContext`，不动超时与连接池 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
+| `cors.enabled` | `false` | 跨域放行开关：开启后为带 `Origin` 的浏览器请求补 `Access-Control-*` 响应头，并直接应答 `OPTIONS` 预检（204，早于鉴权/路由——预检不带 `Authorization`，落到路由只会 401/405）。关闭 = 零行为变化 |
+| `cors.allowed_origins` | `[]` | 允许的来源列表（如 `["http://localhost:18181"]`，逐条精确匹配、大小写不敏感）；空数组 = 放行任意 `Origin`。回显命中来源而非 `*`，故可与 `Allow-Credentials: true` 共存；预检要求的 `Access-Control-Request-Headers` 原样回显（兼容各 OpenAI 客户端的 `x-stainless-*` 头） |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
 | `logging.request_archive_enabled` | `true` | 请求元数据 JSONL 归档开关；不记录提示词、响应正文或 Authorization |
 | `logging.request_retention_days` | `7` | 请求归档保留天数；超期文件在启动和周期清理时删除 |
@@ -523,6 +525,26 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 **熔断器**：所有冷却入口与 5xx 共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
 
 **软冷却指数退避**（与熔断器并存的第二条升级线）：软限流的**冷却时长**本身也按连续次数退避——同一账号连续触发软冷却时 `soft_rate × 2^(连续次数-1)`，封顶 `soft_rate_max`。计数 `soft_streak` 独立于熔断器的 `fails`，只在**成功**或**签到解冻**时清零，随 `state.json` 持久化。
+
+### 选号失败的错误码（谁在拦、该不该重试）
+
+「选不到号」不等于「号全挂了」。网关在选号失败时按**成因**回不同的状态码与 `code`，客户端与运维据此决定「立刻重试 / 等一会儿 / 加号 / 换模型」，不再一律回 `no_healthy_account`（诊断口径见 `pool.DiagnoseNoPick`）：
+
+| 成因 | HTTP | `code` | `Retry-After` | 该做什么 |
+|---|---|---|---|---|
+| 账号健康，但在途名额被长流占满（`pool.max_in_flight`） | 429 | `pool_saturated` | `1` | 短退避重试；频繁出现就调大 `pool.max_in_flight` 或降客户端并发 |
+| 选号瞬间名额被并发请求抢走 / 落在防撞号窗口 | 429 | `pool_contended` | `1` | 立刻重试（瞬态） |
+| 该域所有账号都在冷却（软限流 / 熔断 / 硬冷却） | 429 | `all_accounts_cooling` | 最早解冻剩余秒数 | 按 `Retry-After` 等待 |
+| 该域池子为空 | 503 | `no_accounts` | 无 | 加号（`auths/`），重试无用 |
+| 全账号积分低于 `credit_floor` 且打收费模型 | 503 | `credit_floor_reached` | 无 | 等签到回血 / 用免费模型 / 调低 `credit_floor` |
+| 本轮候选账号已全部试过 | 503 | `rotation_exhausted` | 无 | 真因是上一次上游错误，不是池子没号 |
+| 模型级全挡（`11158` 等） | 400 | `model_unavailable` | 无 | 换模型（不必加号） |
+| 混合形态、判不出主因 | 503 | `no_healthy_account` | 无 | 查 `/status` 与请求日志 |
+
+两条口径约束：
+
+- **有上游原文时原文优先**：只要拿到上游错误体，网关不抢话，仍透传上游 `code` 与文案（只有本地调度类失败才走上表）。
+- **`Retry-After` 只在「等一会儿确实会好」时给**：冷却给最早解冻剩余秒数、背压给 `1`；池空、积分保底、轮转耗尽不给——重试解决不了，给了只会让客户端空转。
 
 ### 选号策略
 

@@ -80,8 +80,11 @@ func TestCreditFloorBlocksPaidRequest(t *testing.T) {
 	if rec.Code != 503 {
 		t.Fatalf("code=%d want 503（全池触底 + 收费模型 → 不放行）, body=%s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), "no_healthy_account") {
-		t.Errorf("body=%s want no_healthy_account", rec.Body)
+	if !strings.Contains(rec.Body.String(), "credit_floor_reached") {
+		t.Errorf("body=%s want credit_floor_reached（不再是笼统的 no_healthy_account）", rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "no_healthy_account") {
+		t.Errorf("body=%s 不应再出现笼统的 no_healthy_account", rec.Body)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -78,6 +79,13 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// CORSEnabled 开启后为带 Origin 的跨域浏览器调用补齐 Access-Control-* 响应头，
+	// 并应答 OPTIONS 预检。缺省 false：不改变任何既有行为。
+	CORSEnabled bool
+	// CORSAllowedOrigins 允许的来源列表（如 ["http://localhost:18181"]）。
+	// 仅当 CORSEnabled=true 时生效；为空 = 放行任意 Origin。
+	CORSAllowedOrigins []string
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -154,6 +162,11 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 跨域预检必须在鉴权/路由之前应答：预检 OPTIONS 不带 Authorization，落到路由
+	// 只会得到 401/405。命中放行来源时先补响应头；若为预检则直接 204 返回。
+	if h.cfg.CORSEnabled && h.applyCORS(w, r) {
+		return
+	}
 	if h.cfg.RequestLog != nil && h.tracedRequest(r) {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if isSearchPath(r.URL.Path) {
@@ -179,6 +192,49 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.mux.ServeHTTP(w, r)
+}
+
+// applyCORS 为带 Origin 的跨域请求补齐 CORS 响应头；若是预检（OPTIONS +
+// Access-Control-Request-Method），直接以 204 应答并返回 true。返回 false 表示
+// 未命中（无 Origin 或来源不被允许），请求继续走正常路由。
+//
+// 只回显命中允许列表的 Origin（允许列表为空 = 放行任意 Origin），因此与
+// Access-Control-Allow-Credentials: true 兼容（不能同时使用 * 通配）。
+func (h *Handler) applyCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" || !h.originAllowed(origin) {
+		return false
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Add("Vary", "Origin")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+	// 回显预检要求的头（Authorization、Content-Type 及 x-stainless-* 等），
+	// 比写死白名单更兼容各 OpenAI 客户端。
+	if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+		w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+	} else {
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-Requested-With")
+	}
+	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	return false
+}
+
+// originAllowed 判断来源是否命中允许列表；列表为空表示放行任意来源。
+func (h *Handler) originAllowed(origin string) bool {
+	if len(h.cfg.CORSAllowedOrigins) == 0 {
+		return true
+	}
+	for _, o := range h.cfg.CORSAllowedOrigins {
+		if strings.EqualFold(o, origin) {
+			return true
+		}
+	}
+	return false
 }
 
 // tracedRequest 判断该请求是否需要请求日志记账（指标 + JSONL 归档）。
@@ -616,6 +672,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
+	// noPick 记录本次选号失败的成因（下方 acct==nil 分支填充）：在途名额占满 /
+	// 全账号冷却 / 积分保底 / 池空各给不同的 code 与 HTTP 状态——此前它们共用一个
+	// no_healthy_account（"号全挂了"语义），把网关背压读成了账号故障。
+	var noPick pool.PickDiagnosis
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -843,6 +903,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 			// 在这里取一次快照，供下方错误构造区分（issue #102 附带发现 1）。
 			modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
+			// 再取一次成因快照：模型级阻塞只是其中一种，剩下还有在途占满 / 全冷却 /
+			// 积分保底 / 池空 / 轮转耗尽，各自该给客户端完全不同的动作指引。
+			// 跨域回退开启时两域都已试过，按全池口径诊断（否则文案只指向单域）。
+			diagRealm := realm
+			if crossRealm {
+				diagRealm = ""
+			}
+			noPick = h.cfg.Pool.DiagnoseNoPick(bareModel, diagRealm, tried)
 			break
 		}
 		st.uid = acct.UID
@@ -1224,6 +1292,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusServiceUnavailable
 	code := "no_healthy_account"
 	msg := "all accounts are temporarily unavailable, please retry later"
+	// retryAfter 非零时写 Retry-After 头（只有"等一会儿确实会好"的成因才给，
+	// 例如全账号冷却、在途名额占满；池空/积分保底/轮转耗尽不给——重试解决不了）。
+	var retryAfter time.Duration
 	// 上游超时：轮转已在传输层分支止损（见 isUpstreamTimeout），这里给一条**能区分**
 	// 的文案，别混进"没有可用账号"——两者的排查方向完全不同。
 	if errors.Is(lastErr, errUpstreamTimeout) {
@@ -1272,6 +1343,70 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			upstreamMsgPassed = true
 		}
 	}
+	// 本地调度类失败（没有上游原文可透传）：按选号成因给可区分的 code/状态。
+	//
+	// 此前这些情况一律 no_healthy_account + 503（"号全挂了"语义），但实测最常见的
+	// 其实只是「两个号被几条长流把 max_in_flight 占满」——一分钟内自愈的纯背压，
+	// 客户端却按"服务端故障"处理、运维按"账号全挂"排查，方向从第一步就跑偏。
+	// 现在按成因分开：
+	//
+	//	in_flight_full → 429 pool_saturated      （背压，短退避重试）
+	//	（无成因/并发竞态）→ 429 pool_contended  （名额刚被并发请求抢走，立刻重试）
+	//	cooling        → 429 all_accounts_cooling（带 Retry-After，等到期再试）
+	//	empty          → 503 no_accounts          （加号，重试无意义）
+	//	credit_floor   → 503 credit_floor_reached  （等签到回血）
+	//	exhausted      → 503 rotation_exhausted    （真因是上游，见上一跳错误）
+	//	model_blocked  → 交给下方 model_unavailable（换模型）
+	//	判不出         → 保留 no_healthy_account
+	//
+	// 只在 ue == nil 时生效：有上游原文时原文优先，本地不抢话。
+	if ue == nil && noPick.Diagnosed {
+		switch noPick.Reason {
+		case pool.NoPickNone:
+			// 诊断时池里还有号可选，但 pick 已经返回 nil：名额被并发请求抢走，
+			// 或落在 minPickGap 防撞号窗口内。两者都是瞬态，重试立刻能成。
+			status = http.StatusTooManyRequests
+			code = "pool_contended"
+			msg = "pool contended: the free account slot was taken by a concurrent request, retry immediately"
+			hint = "transient pick-time contention (concurrent acquire or anti-collision window), not an account failure; retry immediately"
+			retryAfter = time.Second
+		case pool.NoPickInFlightFull:
+			status = http.StatusTooManyRequests
+			code = "pool_saturated"
+			msg = fmt.Sprintf("pool saturated: %d of %d account(s) reached their in-flight limit, retry shortly", noPick.InFlightFull, noPick.Total)
+			hint = "gateway-side backpressure, not an account failure: per-account in-flight cap (pool.max_in_flight) is full; retry after a short backoff, or raise pool.max_in_flight / lower client concurrency"
+			// 背压的恢复时间取决于在途长流何时结束，无法预知；给 1s 让客户端
+			// 走"立刻退避重试"而不是"等一个看起来像硬故障的长间隔"。
+			retryAfter = time.Second
+		case pool.NoPickCooling:
+			status = http.StatusTooManyRequests
+			code = "all_accounts_cooling"
+			secs := int((noPick.RetryAfter + time.Second - 1) / time.Second)
+			msg = fmt.Sprintf("all %d account(s) are cooling down, retry in %ds", noPick.Total, secs)
+			hint = fmt.Sprintf("every account in this realm is cooling down (soft rate limit / breaker / hard credit); %d account(s), earliest recovery at %s; see /status",
+				noPick.Cooling, noPick.EarliestRecovery.Format(time.RFC3339))
+			retryAfter = noPick.RetryAfter
+		case pool.NoPickEmpty:
+			status = http.StatusServiceUnavailable
+			code = "no_accounts"
+			msg = "no account is available for this realm, add an account before retrying"
+			hint = "pool is empty for the requested realm: import an account (auths/) or check the model realm prefix; retrying will not help"
+		case pool.NoPickCreditFloor:
+			status = http.StatusServiceUnavailable
+			code = "credit_floor_reached"
+			msg = "all accounts are below the credit floor, waiting for credits to be restored"
+			hint = fmt.Sprintf("credit_floor guard: every account is under pool.credit_floor (%d), so paid models are refused on purpose to avoid draining the balance; wait for the daily check-in or lower credit_floor", h.cfg.Pool.CreditFloor())
+		case pool.NoPickExhausted:
+			status = http.StatusServiceUnavailable
+			code = "rotation_exhausted"
+			msg = "every candidate account already failed for this request, retry later"
+			hint = "rotation exhausted: all candidate accounts were tried for this request (see max_rotate); the real cause is the previous upstream error, not an empty pool"
+		case pool.NoPickModelBlocked:
+			// 由下方 modelBlock 分支统一给 400 model_unavailable（含上游原因与解封时间）。
+		default:
+			// NoPickUnavailable：混合形态判不出主因，保留 no_healthy_account 口径。
+		}
+	}
 	// 模型级阻塞覆盖上面的通用文案（放在最后 = 优先级最高）。
 	//
 	// 为什么能覆盖 code 而不丢信息：modelBlock.Reason 就是 BlockModelBackoff 存下的
@@ -1295,6 +1430,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			hint += "; upstream: " + s
 		}
 		status = http.StatusBadRequest
+	}
+	// Retry-After 只在"等一会儿确实会好"的成因下写（见上方 retryAfter 赋值）；
+	// 向上取整，避免写出 0 秒这种无意义的头。
+	if retryAfter > 0 {
+		secs := int((retryAfter + time.Second - 1) / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status

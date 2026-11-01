@@ -7,6 +7,10 @@
   "server": {
     "read_timeout": "300s"
   },
+  "cors": {
+    "enabled": false,
+    "allowed_origins": []
+  },
   "panel": {
     "package_detail_limit": 5
   },
