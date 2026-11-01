@@ -102,7 +102,71 @@ go build ./... && go vet ./...
 | 加定时任务 | `internal/scheduler/*.go` + `config.schedule.*_hours` + 面板开关 + README |
 | 加上游业务 API | `internal/upstream/`（按域/端点分文件），错误分类要过 `Classify` |
 
-## 9. 已知坑（踩过的，别再踩）
+## 9. 上游变异应急手册
+
+上游仓库已删库（见 README「与上游的差异」）：**没有 changelog、没有公告、没有兼容承诺、没有公开文档**。它一旦变动，唯一的表现就是"网关突然大面积失败"。下面是排查顺序，不是背景介绍。
+
+### 9.1 先分清是谁的锅（必做，别跳）
+
+同一个请求走两条路，对比结果：
+
+```bash
+# A. 直连上游（用 auths/ 里任一账号的 token，绕过网关）
+curl -sS -D- https://copilot.tencent.com/v2/chat/completions \
+  -H "Authorization: Bearer <token>" \
+  -H "User-Agent: WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-pro","stream":true,"messages":[{"role":"user","content":"ping"}]}'
+
+# B. 经网关（同一请求体）
+curl -sS -D- http://127.0.0.1:<listen>/v1/chat/completions \
+  -H "Authorization: Bearer <api_key>" -H 'Content-Type: application/json' -d '<同一 body>'
+```
+
+| A 直连 | B 网关 | 结论 | 去哪 |
+|---|---|---|---|
+| 错 | 错 | **上游变了** | `internal/upstream` |
+| 对 | 错 | **我们的改写坏了** | `payload.go` / `headers.go` / `sanitize.go` |
+| 对 | 对（但客户端报错） | **出站形态问题** | `sse.go` / `dsml.go` |
+
+取证三件套：`data/request-logs/requests-YYYY-MM-DD.jsonl`（看 `status`/`code`/`account`/耗时）、服务日志里的 `WARN`/`ERROR`、面板 `/panel/` 的请求指标。**`account` 为 `-` 表示压根没选出号——那是池子/调度问题，别去上游找原因。**
+
+### 9.2 症状 → 落点
+
+| 症状 | 首查（按序） | 典型根因 | 不要做什么 | 怎么验证 |
+|---|---|---|---|---|
+| 大面积 `400` + `code 11101` | `payload.go`：`normalizeToolChoice` → `normalizeImageURL` → `normalizeRoles` → `translateMaxCompletionTokens` | 上游收紧了字段类型（对象/字符串、别名不再被接受） | 别冷却账号、别降权（是请求级错误） | 用 9.1 的 A 路复现最小 body，逐字段二分 |
+| `403` + `11140 request illegal`（业务信封内） | `headers.go`：UA 平台段（global 必须 `WorkBuddy AI`）→ `injectAccountStableHeaders` → `X-IDE-*`/`X-Agent-Purpose` | 客户端指纹变了，或新增了校验项 | **别禁用账号**；`isChannelRefused`(11-128) 与 `IsAccountRestricted`(11140) 必须按业务码分流 | 逐项替换 UA 三段式 / 头族复测 |
+| `403` 非业务信封（APISIX WAF 页、空体） | `dns.go` → `ExtractClientIP` → `transport.go` | 出口 IP 被 WAF 拦 | 别按账号故障处理（`ErrWafBlock` 只软冷却+抖动退避） | 换出口 IP 复测 |
+| `401` + `12153`，全池同错 | `client.go` 的 `sessionDeadMarkers` | token 体系变了（refresh 失效） | 别只按 revive 处理，先确认能不能重新登录 | `go run ./cmd/login --realm=cn` 手跑 |
+| 工具一次都不执行；模型把工具标记当文本吐出来 | `dsml.go` 的标记正则（全角竖线 U+FF5C 形态）→ `payload.go` 的 tool 配对三步 | 上游换了标记语法，或 `tools` 又在中转链路丢了 | **别放宽 dsml 的三条硬前提**（会吞正文）；别改 `tool_pairing` 的"一律执行" | 日志 `saw M native tool call block(s) but repaired none`；抓原始 SSE 比对 |
+| 输出莫名截断、写到一半停 | `context_catalog.go` → `scripts/probe_max_tokens.py` | 上游真实上限变了（`/v3/config` 是**声称值、普遍虚高**） | 别信 `/v3/config` 的数字，别调 `idle_timeout` | 重跑 probe，看 `finish=length` 判据 |
+| 客户端把上下文提前截断 | `model_catalog.go` 四级链 → `model.json` | `context_length` 变小了 | 别动"未知 → 1M"的兜底（高估安全、低估丢上下文） | 对比 `/console/enterprises/personal/models` |
+| 费用暴涨 | `cache_key.go` 是否仍在注入 → `prompt` 模式是否每次换 system | 前缀缓存失效（system 抖动 / cache key 变了） | 别先去查选号与倍率 | 看响应里的 `prompt_cache_hit_tokens`（带 key 实测≈0.02，不带≈0.34） |
+| 整池健康号在数秒内被一起冷却 | `client.go: Classify` 的判定次序 | 上游新增了"渠道满载/限流"业务码，被兜底成 `ErrSoftRate` 逐号冷却（6021 实案：2 秒清空整池） | 别只加号、别调大 `max_in_flight`（掩盖问题） | 看 `state.json` 里各号 `cool_kind`/`until` 是否同一时刻 |
+| 流式长时间没响应、或空流 | `idle.go` → `sse.go` | 上游心跳间隔/帧格式变了，或不再发 `[DONE]` | **别给聊天流加总时长上限**（`Timeout=0` 是故意的） | 抓原始 SSE 看心跳与末帧 |
+| 签到/成长/旅行/桌面任务全失败 | `tasks.go` / `report.go` / `desktop.go` / `travel.go` | 业务端点路径或事件字段变了（非公开接口，路径以代码常量为准） | 别改调度时间掩盖失败 | 面板对应按钮手点 + 抓包比对 |
+| 请求被内容审核拦（`blocked by security policy` 等） | `sanitize.go` 的黑名单特征串 → `prompt` 降级链路 | 上游扩充了黑名单指纹 | 别按账号故障处理（`ErrContentBlocked` 不罚号） | 9.1 的 A 路复现，逐句二分定位触发串 |
+
+### 9.3 三类"静默变异"（最危险）
+
+上游不报错、只改行为，只能靠断言与日志发现：
+
+- **静默钳制**：`max_tokens` 给大了不报错，到真实上限就截断（实测 16 个 CN 模型 8 个被钳制，最狠声称 1M 实际 32K）。
+- **静默丢字段**：`tools` 在中转链路丢失是常态 → 工具调用退化成纯文本。
+- **静默降级**：未知字段被直接忽略（`max_completion_tokens` 别名就是这样被吞掉的）。
+
+对策固定为三件：**出站前补位**（`payload.go` / `dsml.go`）、**出站后校验**（`sse.go` / `truncation.go`）、**把每次实测结论写进注释**（带日期与数据，注释就是上游文档）。
+
+### 9.4 改完必须做的五件事
+
+1. **新业务码 → 具体 `ErrKind`**：想清楚"罚不罚号、罚多久"。`Kind` 决定前者，`RetryAfter` 决定后者，两者不要混在一个字段里。
+2. **动了判定次序 → 注释写清"不先判会发生什么"**。现有注释全是这么来的（"2 秒内把整池健康号全部误杀冷却"），别只写"新增 111xx"。
+3. **补测试**：`client_test.go` 加用例；HTTP 契约变了要同步 `server/handler_*_test.go`，且用对照断言（只断言 503 会被假原因满足）。
+4. **同步文档**：README 的字段速查/错误码表 + 本文件 9.2 增一行。
+5. **优先加开关/降级，再改默认**：改默认前先想"上游变回去了怎么办"。可逆性比优雅重要。
+
+## 10. 已知坑（踩过的，别再踩）
 
 - **`no_healthy_account` 的历史包袱**：它曾同时表示「在途满 / 积分保底 / 冷却 / 池空」，把网关背压读成了"号全挂了"。现已按成因拆码（`pool_saturated` / `pool_contended` / `all_accounts_cooling` / `no_accounts` / `credit_floor_reached` / `rotation_exhausted`）。**`POST /v1/search/messages` 仍回固定 503 `no_healthy_account`**（`server/search.go`，未统一）。
 - **`pool.max_in_flight` 默认 3（global 域 2）**：几条长流就能占满，症状是瞬时 429，不是账号故障。根治靠加号或调大上限。
@@ -113,7 +177,7 @@ go build ./... && go vet ./...
 - **`state.json` 里的计数**（`success_count` / `fails` / `soft_streak` / `token_usage`）是运维判断依据，改语义会让历史数据失真——改前想清楚是否要迁移。
 - **本地部署**：`auths` / `data` / `config.json` 是指向 `~/workbuddy2api/` 的符号链接；写该目录超出 workspace 沙箱，需要提权。`build.sh` 末尾的重启会断开在途请求。
 
-## 10. 提交与推送
+## 11. 提交与推送
 
 - 仓库远端：`https://github.com/ruige233/workbuddy2api-panel`（fork 自上游，`main` 单分支）。
 - 提交信息用中文，正文说清「为什么改 + 症状/实测证据 + 影响的错误码或配置」，而不是逐文件罗列。
