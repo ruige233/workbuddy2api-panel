@@ -501,6 +501,19 @@ function renderModelLocks(rows) {
   }
 }
 
+// creditTotals 首页「积分剩余 / 总额」统计条口径（与账号表逐行展示共用同一份
+// accounts）：disabled（已禁用）与 paused（暂停选号）账号**不参与汇总**——它们已
+// 退出选号候选，额度是冻结不可用的，算进剩余/总额会让「可用额度」虚增，误导
+// 运维以为池子里还有这么多分可花。
+// 返回 {rem,tot}，tot=0 表示全部账号都无总额度（旧数据），由调用方决定回退。
+function creditTotals(accounts) {
+  const active = (accounts || []).filter(s => !s.disabled && !s.paused);
+  return {
+    rem: active.reduce((a, s) => a + (s.credits || 0), 0),
+    tot: active.reduce((a, s) => a + (s.credits_total || 0), 0),
+  };
+}
+
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
@@ -511,9 +524,9 @@ async function loadOverview(quiet) {
     $('sDisabled').textContent = d.disabled;
     // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
     if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
-    const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-  const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-  $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    // 积分总量卡：disabled/paused 账号已在 creditTotals 内过滤，见其注释。
+    const ct = creditTotals(d.accounts);
+    $('sCredits').textContent = ct.tot > 0 ? ct.rem + ' / ' + ct.tot : ct.rem;
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
