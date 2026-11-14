@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorkBuddy2API · 控制台</title>
+<!-- 标签页图标：取自官方 WorkBuddy 桌面端 icon.icns（产品本身那枚），与客户端保持一致。
+     相对路径不带 /panel 前缀：面板挂在 /panel/ 下，浏览器按文档 URL 解析，
+     故 /panel/favicon.ico 与 /panel/icon-180.png 都能命中（CSP img-src 'self' 放行同源）。 -->
+<link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="apple-touch-icon" href="icon-180.png">
 <style>
 /* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
    冷石墨基调（仪表盘语言，非营销页）：底色分层 + 单一靛蓝强调（仅交互），

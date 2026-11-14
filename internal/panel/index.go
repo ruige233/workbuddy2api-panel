@@ -5,6 +5,8 @@
 //   - app.js      全部前端逻辑（独立文件而非内联，为了启用无需 unsafe-inline 的严格 CSP）
 //   - mobile.css  手机端（≤760px）适配样式（本仓库自有，上游不维护 → 同步上游不冲突）
 //   - mobile.js   手机端联动逻辑（抽屉开合、宽表卡片化字段名），须在 app.js 之后加载
+//   - favicon.ico 浏览器标签页图标（16/32/48 三尺寸 PNG-in-ICO）
+//   - icon-180.png iOS 主屏 / 高 DPI 场景的 apple-touch-icon
 //
 // 安全头对"面板页面与全部 /panel/api/* 响应"统一生效：CSP 限制脚本只能来自本服务，
 // 禁止被 iframe 嵌套（防点击劫持），禁 MIME 嗅探，并声明不泄露 Referer 出去。
@@ -26,6 +28,16 @@ var mobileCSS []byte
 
 //go:embed mobile.js
 var mobileJS []byte
+
+// favicon 取自官方 WorkBuddy 桌面端图标（/Applications/WorkBuddy.app/Contents/Resources/
+// icon.icns，即产品本身用的那枚），不做二次设计：面板是 WorkBuddy 的配套网关控制台，
+// 标签页图标与客户端保持一致，多标签场景下一眼可辨。
+//
+//go:embed favicon.ico
+var faviconICO []byte
+
+//go:embed icon-180.png
+var appleTouchIcon []byte
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
@@ -83,4 +95,25 @@ func (p *Panel) mobileScript(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(mobileJS)
+}
+
+// favicon 输出标签页图标。
+//
+// 缓存策略刻意给长 max-age：图标随二进制发布、内容不变（改图标必然伴随新构建，
+// 而新构建会换掉二进制里的字节），浏览器缓存住可以避免每次开面板都请求一次。
+func (p *Panel) favicon(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "image/x-icon")
+	w.Header().Set("Cache-Control", "public, max-age=604800")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(faviconICO)
+}
+
+// appleTouchIcon 输出 iOS 主屏图标（180×180）。
+func (p *Panel) appleTouchIcon(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=604800")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(appleTouchIcon)
 }
