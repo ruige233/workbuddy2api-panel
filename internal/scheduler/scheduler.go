@@ -457,6 +457,16 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// checkinAccountDelay 签到账号间限速：与 travel/activity 同口径，避免上游软限流。
+// 2026-11-26 实测根因：09:00:00 两个账号同秒并发签到，第二个号的 checkin+余额查询
+// 连续吃 `upstream soft_rate (http 429) Too Many Requests`——13 天日志里 h 号 9 天
+// 中招（23-26 连续 4 天），最险的 11/24 两轮（09/21 点）全 429，拖到 22:31 面板
+// 手动触发才补上。retryBillingTransient 只重试 ErrServer（5xx），不覆盖 429
+// soft_rate，所以同秒并发必然失败。签到走独立变量而非复用 activityAccountDelay：
+// 两处语义虽同为 800ms，但各自独立演进互不牵连（与 travel/activity 分立同理由）。
+// 测试可置 0。
+var checkinAccountDelay = 800 * time.Millisecond
+
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
 // 若 schedule.include_disabled_in_tasks 打开则一并执行（禁用只关选号，不停保号）。
@@ -466,6 +476,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func (s *Scheduler) RunCheckinNow() {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -480,6 +491,12 @@ func (s *Scheduler) RunCheckinNow() {
 		if a.IsGlobal() {
 			continue
 		}
+		// 账号间限速（checkinAccountDelay）：首个「会发起上游调用」的账号不睡，
+		// 其余账号进循环前等一个间隔。放在门控之后，纯跳过的账号不产生等待。
+		if !first {
+			time.Sleep(checkinAccountDelay)
+		}
+		first = false
 		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
 		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
@@ -679,7 +696,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				EarliestRemaining: earliestRemaining,
 				ExpiryBuckets:     poolExpiryBuckets(buckets),
 			})
-			}(a, st.UID)
+		}(a, st.UID)
 	}
 	wg.Wait()
 	s.lastBalanceRefresh.Store(time.Now().UnixNano())
