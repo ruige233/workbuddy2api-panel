@@ -4,6 +4,8 @@ package scheduler
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -418,6 +420,12 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
+				// 整点触发加随机抖动（checkinJitter）：每天准点打卡是机器人特征，
+				// 抖进 3 分钟窗口内再跑。手动触发（面板/补签）不抖——用户就是要立刻签。
+				if d := checkinJitter(checkinJitterMax); d > 0 {
+					log.Printf("checkin jitter: sleep %s before scheduled run", d.Round(time.Second))
+					time.Sleep(d)
+				}
 				s.RunCheckinNow()
 			case taskTravel:
 				s.RunTravelNow()
@@ -466,6 +474,28 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 两处语义虽同为 800ms，但各自独立演进互不牵连（与 travel/activity 分立同理由）。
 // 测试可置 0。
 var checkinAccountDelay = 800 * time.Millisecond
+
+// checkinJitterMax 每次签到任务整点触发的随机抖动上限：签到在 [0, checkinJitterMax)
+// 内随机延迟后才开始跑。每天准点 09:00:00/21:00:00 打卡是显眼的机器人特征（上游
+// 能用签到时间戳聚类直接识别脚本号），抖开到 3 分钟窗口内均匀分布即与真人手点
+// 无法区分；对 429 也是二次缓解——两个账号本就隔 checkinAccountDelay，抖动又让
+// 两天的触发时刻不再相同。测试可置 0。
+var checkinJitterMax = 3 * time.Minute
+
+// checkinJitter 返回本次签到的随机抖动时长，[0, max) 均匀分布；max<=0 返回 0。
+// 用 crypto/rand 而非 math/rand：全局 math/rand 源会被任意库并发播种/使用，
+// 这里独立源避免引入耦合；单日一次的调用频率下 crypto/rand 的开销可忽略。
+func checkinJitter(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0 //熵不可得时不抖动：准点总比卡死强
+	}
+	n := binary.LittleEndian.Uint64(b[:]) % uint64(max)
+	return time.Duration(n)
+}
 
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
